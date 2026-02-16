@@ -3138,14 +3138,20 @@ def main() -> None:
             if st.button("管理者モードに切替"):
                 if hashlib.sha256(pw.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
                     st.session_state.admin_mode = True
-                    st.experimental_rerun()
+                    try:
+                        st.rerun()
+                    except AttributeError:
+                        st.experimental_rerun()
                 else:
                     st.error("パスワードが正しくありません。")
         else:
             st.success("管理者モード: ON")
             if st.button("管理者モードを終了"):
                 st.session_state.admin_mode = False
-                st.experimental_rerun()
+                try:
+                    st.rerun()
+                except AttributeError:
+                    st.experimental_rerun()
 
         st.divider()
         # ── eBay API 設定 ──
@@ -3160,7 +3166,10 @@ def main() -> None:
                 if st.button("接続解除", key="btn_ebay_disconnect"):
                     delete_setting("ebay_api_key")
                     st.info("eBay API キーを削除しました。")
-                    st.experimental_rerun()
+                    try:
+                        st.rerun()
+                    except AttributeError:
+                        st.experimental_rerun()
         else:
             st.caption("未設定（eBay URLの商品取得に必要）")
             with st.expander("APIキーを設定", expanded=True):
@@ -3184,7 +3193,10 @@ def main() -> None:
                     if key_val:
                         save_setting("ebay_api_key", key_val)
                         st.success("APIキーを保存しました。")
-                        st.experimental_rerun()
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
                     else:
                         st.warning("APIキーを入力してください。")
 
@@ -3201,7 +3213,10 @@ def main() -> None:
                 if st.button("接続解除", key="btn_claude_disconnect"):
                     delete_setting("anthropic_api_key")
                     st.info("Claude API キーを削除しました。")
-                    st.experimental_rerun()
+                    try:
+                        st.rerun()
+                    except AttributeError:
+                        st.experimental_rerun()
             used = st.session_state.get("claude_api_calls", 0)
             st.caption(f"利用回数: {used} 回")
         else:
@@ -3225,7 +3240,10 @@ def main() -> None:
                     if key_val:
                         save_setting("anthropic_api_key", key_val)
                         st.success("APIキーを保存しました。")
-                        st.experimental_rerun()
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
                     else:
                         st.warning("APIキーを入力してください。")
 
@@ -3550,7 +3568,10 @@ def main() -> None:
                 if st.button("🗑️ この履歴を削除", key="btn_delete"):
                     delete_history_row(int(del_id))
                     st.success(f"ID {int(del_id)} の履歴を削除しました。")
-                    st.experimental_rerun()
+                    try:
+                        st.rerun()
+                    except AttributeError:
+                        st.experimental_rerun()
 
                 # コード修正
                 st.markdown("**コードの手動修正**")
@@ -3575,7 +3596,10 @@ def main() -> None:
                     if new_val:
                         update_history_field(int(edit_id), edit_field, current_val, new_val)
                         st.success(f"ID {int(edit_id)} の {edit_field} を更新しました。")
-                        st.experimental_rerun()
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
                     else:
                         st.warning("新しい値を入力してください。")
 
