@@ -44,6 +44,25 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
 # ============================================================
+# 外部コードデータ (JSON) の読み込み
+# ============================================================
+_DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_json(filename: str) -> dict:
+    """データ JSON を読み込む。ファイルが無ければ空 dict を返す。"""
+    path = os.path.join(_DATA_DIR, filename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+HTS_CODES = _load_json("hts_codes.json")    # {"Chapter XX": [{"code":..,"description":..}, ...]}
+JP_HS_CODES = _load_json("jp_hs_codes.json")  # {"Chapter XX": [{"code":..,"hs6":..,"category":..,"description":..}, ...]}
+
+# ============================================================
 # HS コード分類ルールデータベース
 # ============================================================
 # データソース:
@@ -2638,30 +2657,151 @@ def _extract_product_keywords(product_name: str, ctx: Dict[str, object]) -> str:
 # Claude AI 分類エンジン
 # ============================================================
 
-def _build_rules_reference() -> str:
+def _detect_relevant_chapters(
+    product_name: str,
+    description: str = "",
+    item_specifics: Optional[Dict[str, str]] = None,
+    category_path: str = "",
+) -> List[str]:
     """
-    CLASSIFICATION_RULES を Chapter ごとにグループ化し、
-    HS6 / HTS10 / JP_HS9 / カテゴリ / 素材 / 判定理由を含む
-    詳細な参照テキストに変換する。
+    商品情報から関連する HTS Chapter を特定する。
+    CLASSIFICATION_RULES のキーワードマッチ + eBay カテゴリ + ブランド情報を使用。
+    最大5章を返す。
     """
-    # Chapter ごとにグループ化
-    by_chapter = {}  # type: Dict[str, List[Dict]]
-    for r in CLASSIFICATION_RULES:
-        ch = r.get("chapter", "Other")
-        if ch not in by_chapter:
-            by_chapter[ch] = []
-        by_chapter[ch].append(r)
+    combined = "{} {} {}".format(
+        product_name,
+        description or "",
+        category_path or "",
+    ).lower()
+    if item_specifics:
+        combined += " " + " ".join(
+            f"{k} {v}" for k, v in item_specifics.items()
+        ).lower()
 
+    chapter_scores = {}  # type: Dict[str, float]
+
+    # 1. CLASSIFICATION_RULES のキーワードマッチ
+    for rule in CLASSIFICATION_RULES:
+        ch = rule.get("chapter", "")
+        if not ch:
+            continue
+        score = 0.0
+        for kw in rule["keywords"]:
+            if kw.lower() in combined:
+                score += 1.0
+        if score > 0:
+            chapter_scores[ch] = chapter_scores.get(ch, 0) + score
+
+    # 2. ブランド名からの推定
+    for brand, ch in _BRAND_CATEGORY.items():
+        if brand in combined:
+            full_ch = f"Chapter {int(ch.split()[1]):02d}"
+            chapter_scores[full_ch] = chapter_scores.get(full_ch, 0) + 3.0
+
+    # 3. eBay カテゴリパスのキーワード → Chapter マッピング
+    _CATEGORY_CHAPTER_MAP = {
+        "clothing": ["Chapter 61", "Chapter 62"],
+        "apparel": ["Chapter 61", "Chapter 62"],
+        "shoes": ["Chapter 64"],
+        "footwear": ["Chapter 64"],
+        "bags": ["Chapter 42"],
+        "handbag": ["Chapter 42"],
+        "luggage": ["Chapter 42"],
+        "watches": ["Chapter 91"],
+        "jewelry": ["Chapter 71"],
+        "electronics": ["Chapter 85"],
+        "cell phones": ["Chapter 85"],
+        "computers": ["Chapter 84"],
+        "tablets": ["Chapter 84"],
+        "laptops": ["Chapter 84"],
+        "cameras": ["Chapter 85"],
+        "auto parts": ["Chapter 87"],
+        "car parts": ["Chapter 87"],
+        "vehicle parts": ["Chapter 87"],
+        "motors": ["Chapter 87"],
+        "toys": ["Chapter 95"],
+        "sporting goods": ["Chapter 95"],
+        "cosmetics": ["Chapter 33"],
+        "health & beauty": ["Chapter 33"],
+        "skin care": ["Chapter 33"],
+        "fragrance": ["Chapter 33"],
+        "home & garden": ["Chapter 94"],
+        "furniture": ["Chapter 94"],
+        "kitchen": ["Chapter 73", "Chapter 69"],
+        "musical instruments": ["Chapter 92"],
+        "books": ["Chapter 49"],
+        "pet supplies": ["Chapter 42"],
+    }
+    cat_lower = (category_path or "").lower()
+    for cat_kw, chapters in _CATEGORY_CHAPTER_MAP.items():
+        if cat_kw in cat_lower:
+            for ch in chapters:
+                chapter_scores[ch] = chapter_scores.get(ch, 0) + 5.0
+
+    if not chapter_scores:
+        # フォールバック: 最も一般的な chapter を返す
+        return ["Chapter 85", "Chapter 61", "Chapter 84", "Chapter 42", "Chapter 87"]
+
+    # スコア順にソート、上位5章
+    sorted_chs = sorted(chapter_scores.items(), key=lambda x: x[1], reverse=True)
+    return [ch for ch, _ in sorted_chs[:5]]
+
+
+def _build_hts_reference_for_chapters(chapters: List[str]) -> str:
+    """
+    指定された Chapter の HTS コード一覧をプロンプト用テキストに変換する。
+    HTS_CODES (JSON) から取得。トークン節約のため最大 3 章分を含める。
+    """
     lines = []
-    for ch in sorted(by_chapter.keys()):
+    included = 0
+    for ch in chapters:
+        if ch not in HTS_CODES:
+            continue
+        codes = HTS_CODES[ch]
+        lines.append(f"=== {ch} ({len(codes)} codes) ===")
+        for entry in codes:
+            lines.append(f"  {entry['code']}: {entry['description']}")
+        included += 1
+        if included >= 3:
+            break
+
+    if not lines:
+        return "(該当するHTSコード一覧が見つかりません)"
+    return "\n".join(lines)
+
+
+def _build_jp_hs_reference_for_chapters(chapters: List[str]) -> str:
+    """
+    指定された Chapter の日本 HS コード一覧をプロンプト用テキストに変換する。
+    JP_HS_CODES (JSON) から取得。
+    """
+    lines = []
+    for ch in chapters[:3]:
+        if ch not in JP_HS_CODES:
+            continue
+        codes = JP_HS_CODES[ch]
         lines.append(f"=== {ch} ===")
-        for r in by_chapter[ch]:
+        for entry in codes:
+            lines.append(f"  {entry['code']}: {entry['category']} | {entry['description']}")
+    return "\n".join(lines) if lines else "(該当する日本HSコード一覧が見つかりません)"
+
+
+def _build_rules_reference_for_chapters(chapters: List[str]) -> str:
+    """
+    CLASSIFICATION_RULES から指定 Chapter のルールをプロンプト用テキストに変換する。
+    """
+    lines = []
+    for ch in chapters[:3]:
+        ch_rules = [r for r in CLASSIFICATION_RULES if r.get("chapter") == ch]
+        if not ch_rules:
+            continue
+        lines.append(f"=== {ch} (キーワードルール) ===")
+        for r in ch_rules:
             kw = ", ".join(r["keywords"][:6])
             lines.append(
-                f"  HS6: {r['hs6']} | HTS10: {r['hts10']} | JP_HS9: {r['jp_hs9']}"
+                f"  HS6: {r['hs6']} | HTS: {r['hts10']} | JP_HS: {r['jp_hs9']}"
                 f" | {r['category']} | {r['material']}"
                 f" | keywords: {kw}"
-                f" | {r['reason']}"
             )
     return "\n".join(lines)
 
@@ -2674,32 +2814,51 @@ def _call_claude_api(
 ) -> Optional[List[Dict]]:
     """
     Claude API で商品を HS コードに分類する。
+    1. 商品情報から関連 Chapter を特定
+    2. その Chapter の全 HTS コード一覧をプロンプトに含める
+    3. Claude に一覧から最適なコードを選ばせる
     失敗時は None を返し、呼び出し元が従来ロジックにフォールバックする。
     """
     api_key = _get_anthropic_api_key()
     if not api_key:
         return None
 
-    rules_ref = _build_rules_reference()
+    # 関連 Chapter を特定
+    relevant_chapters = _detect_relevant_chapters(
+        product_name, description, item_specifics, category_path
+    )
+
+    # 各 Chapter の HTS コード一覧を構築
+    hts_ref = _build_hts_reference_for_chapters(relevant_chapters)
+    jp_hs_ref = _build_jp_hs_reference_for_chapters(relevant_chapters)
+    rules_ref = _build_rules_reference_for_chapters(relevant_chapters)
 
     system_prompt = (
         "あなたはHS/HTSコード分類の専門家です。\n\n"
         "【重要ルール】\n"
-        "- 回答には必ず下記「HTSコード一覧」に存在するコードのみを使用してください。\n"
-        "- 一覧にないHS6・HTS10・JP_HS9コードを独自に生成・推測してはいけません。\n"
-        "- 該当する商品に最も適切なコードを一覧の中から選んでください。\n"
+        "- 回答には必ず下記「米国HTSコード一覧」に存在するコードのみを使用してください。\n"
+        "- 一覧にないHTSコードを独自に生成・推測してはいけません。\n"
+        "- 該当する商品に最も適切なHTSコード（8桁 XXXX.XX.XX）を一覧の中から選んでください。\n"
+        "- HS6桁はHTSコードの上位6桁（XXXX.XX）を使用してください。\n"
+        "- 日本HSコードは「日本HSコード参照」に該当があればそれを使用し、\n"
+        "  なければHS6桁に .000 を付与してください。\n"
         "- 一覧のどのコードにも該当しない場合は、最も近いコードを選び、\n"
-        "  confidence を \"low\" にして reason にその旨を記載してください。\n\n"
-        "【HTSコード一覧】\n"
+        '  confidence を "low" にして reason にその旨を記載してください。\n\n'
+        f"【対象Chapter】{', '.join(relevant_chapters)}\n\n"
+        "【米国HTSコード一覧（この中から選択）】\n"
+        f"{hts_ref}\n\n"
+        "【日本HSコード参照】\n"
+        f"{jp_hs_ref}\n\n"
+        "【キーワードルール参照】\n"
         f"{rules_ref}\n\n"
         "【回答形式】\n"
         "必ず以下のJSON形式のみで返してください。説明文やマークダウンは不要です:\n"
         '{"candidates": [\n'
-        '  {"hs6": "XXXX.XX", "hts": "XXXX.XX.XXXX", "jp_hs": "XXXX.XX.XXX", '
+        '  {"hs6": "XXXX.XX", "hts": "XXXX.XX.XX", "jp_hs": "XXXX.XX.XXX", '
         '"category": "カテゴリ名", "material": "素材", "usage": "用途", '
         '"chapter": "Chapter XX", "reason": "判定理由", "confidence": "high/medium/low"}\n'
         "]}\n"
-        "candidatesは最大3件。上記一覧から最も適切なコードを選択してください。"
+        "candidatesは最大3件。上記HTSコード一覧から最も適切なコードを選択してください。"
     )
 
     # ユーザーメッセージ構築
