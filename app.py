@@ -2639,11 +2639,30 @@ def _extract_product_keywords(product_name: str, ctx: Dict[str, object]) -> str:
 # ============================================================
 
 def _build_rules_reference() -> str:
-    """CLASSIFICATION_RULES をコンパクトな参照テキストに変換する。"""
-    lines = []
+    """
+    CLASSIFICATION_RULES を Chapter ごとにグループ化し、
+    HS6 / HTS10 / JP_HS9 / カテゴリ / 素材 / 判定理由を含む
+    詳細な参照テキストに変換する。
+    """
+    # Chapter ごとにグループ化
+    by_chapter = {}  # type: Dict[str, List[Dict]]
     for r in CLASSIFICATION_RULES:
-        kw = ",".join(r["keywords"][:5])
-        lines.append(f'{r["hs6"]}|{r["category"]}|{r["material"]}|{kw}')
+        ch = r.get("chapter", "Other")
+        if ch not in by_chapter:
+            by_chapter[ch] = []
+        by_chapter[ch].append(r)
+
+    lines = []
+    for ch in sorted(by_chapter.keys()):
+        lines.append(f"=== {ch} ===")
+        for r in by_chapter[ch]:
+            kw = ", ".join(r["keywords"][:6])
+            lines.append(
+                f"  HS6: {r['hs6']} | HTS10: {r['hts10']} | JP_HS9: {r['jp_hs9']}"
+                f" | {r['category']} | {r['material']}"
+                f" | keywords: {kw}"
+                f" | {r['reason']}"
+            )
     return "\n".join(lines)
 
 
@@ -2664,18 +2683,23 @@ def _call_claude_api(
     rules_ref = _build_rules_reference()
 
     system_prompt = (
-        "あなたはHS/HTSコード分類の専門家です。商品情報からHS6桁コード、米国HTS10桁コード、"
-        "日本HS9桁コードを判定してください。\n\n"
-        "以下は既知の分類ルール参照データです（hs6|category|material|keywords）:\n"
+        "あなたはHS/HTSコード分類の専門家です。\n\n"
+        "【重要ルール】\n"
+        "- 回答には必ず下記「HTSコード一覧」に存在するコードのみを使用してください。\n"
+        "- 一覧にないHS6・HTS10・JP_HS9コードを独自に生成・推測してはいけません。\n"
+        "- 該当する商品に最も適切なコードを一覧の中から選んでください。\n"
+        "- 一覧のどのコードにも該当しない場合は、最も近いコードを選び、\n"
+        "  confidence を \"low\" にして reason にその旨を記載してください。\n\n"
+        "【HTSコード一覧】\n"
         f"{rules_ref}\n\n"
-        "回答は必ず以下のJSON形式のみで返してください。説明文やマークダウンは不要です:\n"
+        "【回答形式】\n"
+        "必ず以下のJSON形式のみで返してください。説明文やマークダウンは不要です:\n"
         '{"candidates": [\n'
         '  {"hs6": "XXXX.XX", "hts": "XXXX.XX.XXXX", "jp_hs": "XXXX.XX.XXX", '
         '"category": "カテゴリ名", "material": "素材", "usage": "用途", '
         '"chapter": "Chapter XX", "reason": "判定理由", "confidence": "high/medium/low"}\n'
         "]}\n"
-        "candidatesは最大3件。参照データに一致するルールがあればそれを優先し、"
-        "なければ専門知識で判定してください。"
+        "candidatesは最大3件。上記一覧から最も適切なコードを選択してください。"
     )
 
     # ユーザーメッセージ構築
