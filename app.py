@@ -2834,31 +2834,33 @@ def _call_claude_api(
     rules_ref = _build_rules_reference_for_chapters(relevant_chapters)
 
     system_prompt = (
-        "あなたはHS/HTSコード分類の専門家です。\n\n"
-        "【重要ルール】\n"
-        "- 回答には必ず下記「米国HTSコード一覧」に存在するコードのみを使用してください。\n"
-        "- 一覧にないHTSコードを独自に生成・推測してはいけません。\n"
-        "- 該当する商品に最も適切なHTSコード（8桁 XXXX.XX.XX）を一覧の中から選んでください。\n"
-        "- HS6桁はHTSコードの上位6桁（XXXX.XX）を使用してください。\n"
-        "- 日本HSコードは「日本HSコード参照」に該当があればそれを使用し、\n"
-        "  なければHS6桁に .000 を付与してください。\n"
-        "- 一覧のどのコードにも該当しない場合は、最も近いコードを選び、\n"
-        '  confidence を "low" にして reason にその旨を記載してください。\n\n'
-        f"【対象Chapter】{', '.join(relevant_chapters)}\n\n"
-        "【米国HTSコード一覧（この中から選択）】\n"
+        "You are an expert in HS/HTS tariff classification.\n\n"
+        "【STRICT RULES】\n"
+        "- You MUST only use HTS codes that exist in the 'US HTS Code List' below.\n"
+        "- Do NOT generate or guess any HTS code not in the list.\n"
+        "- Select the most appropriate HTS code (8-digit XXXX.XX.XX) from the list.\n"
+        "- For hs6, use the first 6 digits of the HTS code (XXXX.XX).\n"
+        "- For jp_hs, use the 'JP HS Code Reference' if available; otherwise append .000 to hs6.\n"
+        "- If no code in the list matches well, pick the closest one and set confidence to \"low\"\n"
+        "  with an explanation in reason.\n\n"
+        "【LANGUAGE RULES】\n"
+        "- category, material, usage, reason: MUST be written in Japanese.\n"
+        "- hs6, hts, jp_hs, chapter, confidence: keep alphanumeric / English as-is.\n\n"
+        f"【Target Chapters】{', '.join(relevant_chapters)}\n\n"
+        "【US HTS Code List (select from this list)】\n"
         f"{hts_ref}\n\n"
-        "【日本HSコード参照】\n"
+        "【JP HS Code Reference】\n"
         f"{jp_hs_ref}\n\n"
-        "【キーワードルール参照】\n"
+        "【Keyword Rule Reference】\n"
         f"{rules_ref}\n\n"
-        "【回答形式】\n"
-        "必ず以下のJSON形式のみで返してください。説明文やマークダウンは不要です:\n"
+        "【RESPONSE FORMAT】\n"
+        "Return ONLY the following JSON. No markdown, no explanation:\n"
         '{"candidates": [\n'
         '  {"hs6": "XXXX.XX", "hts": "XXXX.XX.XX", "jp_hs": "XXXX.XX.XXX", '
-        '"category": "カテゴリ名", "material": "素材", "usage": "用途", '
-        '"chapter": "Chapter XX", "reason": "判定理由", "confidence": "high/medium/low"}\n'
+        '"category": "日本語カテゴリ名", "material": "日本語素材名", "usage": "日本語用途", '
+        '"chapter": "Chapter XX", "reason": "日本語で判定理由", "confidence": "high/medium/low"}\n'
         "]}\n"
-        "candidatesは最大3件。上記HTSコード一覧から最も適切なコードを選択してください。"
+        "Return up to 3 candidates. Select the best matching codes from the US HTS Code List above."
     )
 
     # ユーザーメッセージ構築
