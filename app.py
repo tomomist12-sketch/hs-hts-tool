@@ -1221,61 +1221,96 @@ def _get_ebay_marketplace_id(url: str) -> str:
         return "EBAY_US"
 
 
-def _get_ebay_oauth_token() -> Optional[str]:
+def _get_ebay_client_credentials() -> Tuple[str, str]:
     """
-    eBay OAuth トークンを取得する（優先順位）:
-    1. Streamlit Secrets (EBAY_API_KEY)
-    2. 環境変数 EBAY_API_KEY
-    3. SQLite に保存済みのトークン（サイドバーから設定）
-    4. 環境変数 EBAY_CLIENT_ID + EBAY_CLIENT_SECRET → 自動トークン取得
+    eBay Client ID / Client Secret を取得する（優先順位）:
+    1. Streamlit Secrets
+    2. 環境変数
+    3. SQLite に保存済み（サイドバーから設定）
     """
-    # 方法1: Streamlit Secrets
+    client_id = ""
+    client_secret = ""
+
+    # Streamlit Secrets
     try:
-        token = st.secrets["EBAY_API_KEY"]
-        if token:
-            return token
+        client_id = st.secrets.get("EBAY_CLIENT_ID", "")
+        client_secret = st.secrets.get("EBAY_CLIENT_SECRET", "")
+        if client_id and client_secret:
+            return client_id, client_secret
     except (KeyError, FileNotFoundError):
         pass
 
-    # 方法2: 環境変数（直接トークン）
-    token = os.environ.get("EBAY_API_KEY", "").strip()
-    if token:
-        return token
-
-    # 方法3: DB に保存済みトークン
-    try:
-        saved = get_setting("ebay_api_key")
-        if saved:
-            return saved
-    except Exception:
-        pass
-
-    # 方法4: Client Credentials Grant
+    # 環境変数
     client_id = os.environ.get("EBAY_CLIENT_ID", "").strip()
     client_secret = os.environ.get("EBAY_CLIENT_SECRET", "").strip()
     if client_id and client_secret:
-        try:
-            creds = base64.b64encode(
-                f"{client_id}:{client_secret}".encode()
-            ).decode()
-            resp = requests.post(
-                EBAY_API_BASE + "/identity/v1/oauth2/token",
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Authorization": f"Basic {creds}",
-                },
-                data={
-                    "grant_type": "client_credentials",
-                    "scope": "https://api.ebay.com/oauth/api_scope",
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return resp.json().get("access_token", "")
-        except Exception:
-            return None
+        return client_id, client_secret
 
-    return None
+    # DB 保存済み
+    try:
+        client_id = get_setting("ebay_client_id") or ""
+        client_secret = get_setting("ebay_client_secret") or ""
+        if client_id and client_secret:
+            return client_id, client_secret
+    except Exception:
+        pass
+
+    return "", ""
+
+
+def _fetch_ebay_app_token(client_id: str, client_secret: str) -> Optional[str]:
+    """Client Credentials Grant でアプリケーショントークンを取得する。"""
+    try:
+        creds = base64.b64encode(
+            f"{client_id}:{client_secret}".encode()
+        ).decode()
+        resp = requests.post(
+            EBAY_API_BASE + "/identity/v1/oauth2/token",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {creds}",
+            },
+            data={
+                "grant_type": "client_credentials",
+                "scope": "https://api.ebay.com/oauth/api_scope",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token", "")
+        expires_in = data.get("expires_in", 7200)  # デフォルト2時間
+        if token:
+            # セッションにキャッシュ（有効期限を60秒短縮してマージン確保）
+            import time
+            st.session_state["_ebay_token"] = token
+            st.session_state["_ebay_token_expires"] = time.time() + expires_in - 60
+        return token
+    except Exception:
+        return None
+
+
+def _get_ebay_oauth_token() -> Optional[str]:
+    """
+    eBay OAuth アプリケーショントークンを取得する。
+    Client ID + Client Secret から Client Credentials Grant で自動取得し、
+    セッション内でキャッシュ（有効期限内は再利用）。
+    """
+    import time
+
+    # キャッシュされたトークンが有効期限内ならそのまま返す
+    cached = st.session_state.get("_ebay_token", "")
+    expires = st.session_state.get("_ebay_token_expires", 0)
+    if cached and time.time() < expires:
+        return cached
+
+    # Client Credentials を取得
+    client_id, client_secret = _get_ebay_client_credentials()
+    if not client_id or not client_secret:
+        return None
+
+    # トークンを新規取得
+    return _fetch_ebay_app_token(client_id, client_secret)
 
 
 def _get_anthropic_api_key() -> Optional[str]:
@@ -1318,6 +1353,21 @@ def _is_key_preconfigured(key_name: str) -> bool:
         pass
     # 環境変数
     if os.environ.get(key_name, "").strip():
+        return True
+    return False
+
+
+def _is_ebay_preconfigured() -> bool:
+    """eBay Client ID/Secret が Secrets または環境変数で事前設定されているかを判定する。"""
+    # Streamlit Secrets
+    try:
+        if st.secrets.get("EBAY_CLIENT_ID") and st.secrets.get("EBAY_CLIENT_SECRET"):
+            return True
+    except (KeyError, FileNotFoundError):
+        pass
+    # 環境変数
+    if (os.environ.get("EBAY_CLIENT_ID", "").strip()
+            and os.environ.get("EBAY_CLIENT_SECRET", "").strip()):
         return True
     return False
 
@@ -3341,49 +3391,67 @@ def main() -> None:
         st.divider()
         # ── eBay API 設定 ──
         st.subheader("eBay API")
-        ebay_token = _get_ebay_oauth_token()
-        if ebay_token:
-            if _is_key_preconfigured("EBAY_API_KEY"):
+        ebay_cid, ebay_csec = _get_ebay_client_credentials()
+        ebay_configured = bool(ebay_cid and ebay_csec)
+        if ebay_configured:
+            if _is_ebay_preconfigured():
                 st.success("接続済み（事前設定）")
             else:
-                masked = ebay_token[:8] + "..." if len(ebay_token) > 8 else "****"
-                st.success(f"接続済み（{masked}）")
+                masked_cid = ebay_cid[:8] + "..." if len(ebay_cid) > 8 else "****"
+                st.success(f"接続済み（{masked_cid}）")
                 if st.button("接続解除", key="btn_ebay_disconnect"):
-                    delete_setting("ebay_api_key")
-                    st.info("eBay API キーを削除しました。")
+                    delete_setting("ebay_client_id")
+                    delete_setting("ebay_client_secret")
+                    # キャッシュもクリア
+                    st.session_state.pop("_ebay_token", None)
+                    st.session_state.pop("_ebay_token_expires", None)
+                    st.info("eBay API 設定を削除しました。")
                     try:
                         st.rerun()
                     except AttributeError:
                         st.experimental_rerun()
         else:
             st.caption("未設定（eBay URLの商品取得に必要）")
-            with st.expander("APIキーを設定", expanded=True):
+            with st.expander("API設定", expanded=True):
                 st.markdown(
                     "**取得手順:**\n"
                     "1. [developer.ebay.com](https://developer.ebay.com) にログイン\n"
-                    "2. 右上のユーザーネーム → **User Access Tokens** をクリック\n"
-                    "3. 「Get a User Token Here」セクションで **OAuth (new security)** を選択\n"
-                    "4. **Sign in to Production** ボタンをクリックして eBay アカウントで認証\n"
-                    "5. 「Copy Token to Clipboard」でトークンをコピー\n"
-                    "6. 下のフィールドに貼り付けて保存"
+                    "2. **Application Keys** ページを開く\n"
+                    "3. Production 環境の **App ID (Client ID)** と "
+                    "**Cert ID (Client Secret)** をコピー\n"
+                    "4. 下のフィールドに貼り付けて保存\n\n"
+                    "*トークンは自動取得・更新されます（有効期限2時間）*"
                 )
-                api_key_input = st.text_input(
-                    "OAuth Access Token",
+                ebay_cid_input = st.text_input(
+                    "Client ID (App ID)",
                     type="password",
-                    key="ebay_api_key_input",
-                    placeholder="v^1.1#i^1#I^3#p^1#...",
+                    key="ebay_client_id_input",
+                    placeholder="YourApp-Produc-PRD-xxxxxxxxx-xxxxxxxx",
+                )
+                ebay_csec_input = st.text_input(
+                    "Client Secret (Cert ID)",
+                    type="password",
+                    key="ebay_client_secret_input",
+                    placeholder="PRD-xxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
                 )
                 if st.button("保存して接続", key="btn_ebay_save"):
-                    key_val = api_key_input.strip()
-                    if key_val:
-                        save_setting("ebay_api_key", key_val)
-                        st.success("APIキーを保存しました。")
-                        try:
-                            st.rerun()
-                        except AttributeError:
-                            st.experimental_rerun()
+                    cid_val = ebay_cid_input.strip()
+                    csec_val = ebay_csec_input.strip()
+                    if cid_val and csec_val:
+                        # 接続テスト
+                        test_token = _fetch_ebay_app_token(cid_val, csec_val)
+                        if test_token:
+                            save_setting("ebay_client_id", cid_val)
+                            save_setting("ebay_client_secret", csec_val)
+                            st.success("接続成功。設定を保存しました。")
+                            try:
+                                st.rerun()
+                            except AttributeError:
+                                st.experimental_rerun()
+                        else:
+                            st.error("接続失敗: Client ID/Secret を確認してください。")
                     else:
-                        st.warning("APIキーを入力してください。")
+                        st.warning("Client ID と Client Secret の両方を入力してください。")
 
         st.divider()
         # ── Claude AI 分類設定 ──
@@ -3450,7 +3518,8 @@ def main() -> None:
     # APIキー未設定時の案内表示
     # ==========================
     _has_claude = _get_anthropic_api_key() is not None
-    _has_ebay = _get_ebay_oauth_token() is not None
+    _ebay_cid, _ebay_csec = _get_ebay_client_credentials()
+    _has_ebay = bool(_ebay_cid and _ebay_csec)
     if not _has_claude and not _has_ebay:
         st.info("サイドバーからAPIキーを設定するとAI高精度判定とeBay自動取得が使えます")
     elif not _has_claude:
