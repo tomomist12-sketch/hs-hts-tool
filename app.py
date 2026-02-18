@@ -1078,7 +1078,8 @@ def _load_local_storage_keys() -> None:
                 return JSON.stringify({
                     ak: localStorage.getItem('hts_anthropic_api_key') || '',
                     eci: localStorage.getItem('hts_ebay_client_id') || '',
-                    ecs: localStorage.getItem('hts_ebay_client_secret') || ''
+                    ecs: localStorage.getItem('hts_ebay_client_secret') || '',
+                    pin: localStorage.getItem('hts_settings_pin') || ''
                 });
             } catch(e) { return '{}'; }
         })()""",
@@ -1093,6 +1094,8 @@ def _load_local_storage_keys() -> None:
                 st.session_state["_ls_ebay_client_id"] = data["eci"]
             if data.get("ecs"):
                 st.session_state["_ls_ebay_client_secret"] = data["ecs"]
+            if data.get("pin"):
+                st.session_state["_ls_settings_pin"] = data["pin"]
             st.session_state["_ls_keys_loaded"] = True
         except (json.JSONDecodeError, TypeError):
             pass
@@ -1100,6 +1103,12 @@ def _load_local_storage_keys() -> None:
 
 def _process_local_storage_ops() -> None:
     """Pending な localStorage 書き込み/削除を実行する。"""
+    if "_ls_save_pin" in st.session_state:
+        val = st.session_state.pop("_ls_save_pin")
+        components.html(
+            f"<script>try{{localStorage.setItem('hts_settings_pin',{json.dumps(val)})}}catch(e){{}}</script>",
+            height=0,
+        )
     if "_ls_save_claude" in st.session_state:
         val = st.session_state.pop("_ls_save_claude")
         components.html(
@@ -1126,6 +1135,11 @@ def _process_local_storage_ops() -> None:
             "localStorage.removeItem('hts_ebay_client_id');"
             "localStorage.removeItem('hts_ebay_client_secret')"
             "}catch(e){}</script>",
+            height=0,
+        )
+    if st.session_state.pop("_ls_remove_pin", False):
+        components.html(
+            "<script>try{localStorage.removeItem('hts_settings_pin')}catch(e){}</script>",
             height=0,
         )
 
@@ -3489,23 +3503,36 @@ def main() -> None:
             else:
                 masked_cid = ebay_cid[:8] + "..." if len(ebay_cid) > 8 else "****"
                 st.success(f"接続済み（{masked_cid}）")
+                stored_pin = st.session_state.get("_ls_settings_pin", "")
+                if stored_pin:
+                    pin_ebay_dc = st.text_input(
+                        "管理PIN", type="password", key="pin_ebay_dc",
+                        placeholder="接続解除にはPINが必要",
+                    )
                 if st.button("接続解除", key="btn_ebay_disconnect"):
-                    # localStorage から削除
-                    st.session_state["_ls_remove_ebay"] = True
-                    st.session_state.pop("_ls_ebay_client_id", None)
-                    st.session_state.pop("_ls_ebay_client_secret", None)
-                    st.session_state.pop("_ls_keys_loaded", None)
-                    # DB からも削除（レガシー互換）
-                    delete_setting("ebay_client_id")
-                    delete_setting("ebay_client_secret")
-                    # キャッシュもクリア
-                    st.session_state.pop("_ebay_token", None)
-                    st.session_state.pop("_ebay_token_expires", None)
-                    st.info("eBay API 設定を削除しました。")
-                    try:
-                        st.rerun()
-                    except AttributeError:
-                        st.experimental_rerun()
+                    if stored_pin and hashlib.sha256(pin_ebay_dc.encode()).hexdigest() != stored_pin:
+                        st.error("管理PINが正しくありません。")
+                    else:
+                        # localStorage から削除
+                        st.session_state["_ls_remove_ebay"] = True
+                        st.session_state.pop("_ls_ebay_client_id", None)
+                        st.session_state.pop("_ls_ebay_client_secret", None)
+                        st.session_state.pop("_ls_keys_loaded", None)
+                        # DB からも削除（レガシー互換）
+                        delete_setting("ebay_client_id")
+                        delete_setting("ebay_client_secret")
+                        # キャッシュもクリア
+                        st.session_state.pop("_ebay_token", None)
+                        st.session_state.pop("_ebay_token_expires", None)
+                        # 他のキーが残っていなければ PIN も削除
+                        if not st.session_state.get("_ls_anthropic_api_key", ""):
+                            st.session_state["_ls_remove_pin"] = True
+                            st.session_state.pop("_ls_settings_pin", None)
+                        st.info("eBay API 設定を削除しました。")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
         else:
             st.caption("未設定（eBay URLの商品取得に必要）")
             with st.expander("API設定", expanded=True):
@@ -3530,10 +3557,24 @@ def main() -> None:
                     key="ebay_client_secret_input",
                     placeholder="PRD-xxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
                 )
+                _existing_pin = st.session_state.get("_ls_settings_pin", "")
+                if not _existing_pin:
+                    ebay_pin_input = st.text_input(
+                        "管理PIN（4桁以上）",
+                        type="password",
+                        key="ebay_pin_input",
+                        placeholder="接続解除時に必要です",
+                        help="このPINを知っている人だけが接続解除・変更できます",
+                    )
                 if st.button("保存して接続", key="btn_ebay_save"):
                     cid_val = ebay_cid_input.strip()
                     csec_val = ebay_csec_input.strip()
-                    if cid_val and csec_val:
+                    pin_val = "" if _existing_pin else ebay_pin_input.strip()
+                    if not cid_val or not csec_val:
+                        st.warning("Client ID と Client Secret の両方を入力してください。")
+                    elif not _existing_pin and len(pin_val) < 4:
+                        st.warning("管理PINは4桁以上で入力してください。")
+                    else:
                         # 接続テスト
                         test_token = _fetch_ebay_app_token(cid_val, csec_val)
                         if test_token:
@@ -3541,6 +3582,11 @@ def main() -> None:
                             st.session_state["_ls_save_ebay"] = (cid_val, csec_val)
                             st.session_state["_ls_ebay_client_id"] = cid_val
                             st.session_state["_ls_ebay_client_secret"] = csec_val
+                            # PIN を保存（未設定の場合のみ）
+                            if not _existing_pin:
+                                pin_hash = hashlib.sha256(pin_val.encode()).hexdigest()
+                                st.session_state["_ls_save_pin"] = pin_hash
+                                st.session_state["_ls_settings_pin"] = pin_hash
                             st.success("接続成功。ブラウザに保存しました。")
                             try:
                                 st.rerun()
@@ -3548,8 +3594,6 @@ def main() -> None:
                                 st.experimental_rerun()
                         else:
                             st.error("接続失敗: Client ID/Secret を確認してください。")
-                    else:
-                        st.warning("Client ID と Client Secret の両方を入力してください。")
 
         st.divider()
         # ── Claude AI 分類設定 ──
@@ -3561,18 +3605,31 @@ def main() -> None:
             else:
                 masked_ck = claude_key[:8] + "..." if len(claude_key) > 8 else "****"
                 st.success(f"接続済み（{masked_ck}）")
+                stored_pin = st.session_state.get("_ls_settings_pin", "")
+                if stored_pin:
+                    pin_claude_dc = st.text_input(
+                        "管理PIN", type="password", key="pin_claude_dc",
+                        placeholder="接続解除にはPINが必要",
+                    )
                 if st.button("接続解除", key="btn_claude_disconnect"):
-                    # localStorage から削除
-                    st.session_state["_ls_remove_claude"] = True
-                    st.session_state.pop("_ls_anthropic_api_key", None)
-                    st.session_state.pop("_ls_keys_loaded", None)
-                    # DB からも削除（レガシー互換）
-                    delete_setting("anthropic_api_key")
-                    st.info("Claude API キーを削除しました。")
-                    try:
-                        st.rerun()
-                    except AttributeError:
-                        st.experimental_rerun()
+                    if stored_pin and hashlib.sha256(pin_claude_dc.encode()).hexdigest() != stored_pin:
+                        st.error("管理PINが正しくありません。")
+                    else:
+                        # localStorage から削除
+                        st.session_state["_ls_remove_claude"] = True
+                        st.session_state.pop("_ls_anthropic_api_key", None)
+                        st.session_state.pop("_ls_keys_loaded", None)
+                        # DB からも削除（レガシー互換）
+                        delete_setting("anthropic_api_key")
+                        # 他のキーが残っていなければ PIN も削除
+                        if not st.session_state.get("_ls_ebay_client_id", ""):
+                            st.session_state["_ls_remove_pin"] = True
+                            st.session_state.pop("_ls_settings_pin", None)
+                        st.info("Claude API キーを削除しました。")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
             used = st.session_state.get("claude_api_calls", 0)
             st.caption(f"利用回数: {used} 回")
         else:
@@ -3591,19 +3648,36 @@ def main() -> None:
                     key="claude_api_key_input",
                     placeholder="sk-ant-...",
                 )
+                _existing_pin_c = st.session_state.get("_ls_settings_pin", "")
+                if not _existing_pin_c:
+                    claude_pin_input = st.text_input(
+                        "管理PIN（4桁以上）",
+                        type="password",
+                        key="claude_pin_input",
+                        placeholder="接続解除時に必要です",
+                        help="このPINを知っている人だけが接続解除・変更できます",
+                    )
                 if st.button("保存して接続", key="btn_claude_save"):
                     key_val = claude_key_input.strip()
-                    if key_val:
+                    pin_val = "" if _existing_pin_c else claude_pin_input.strip()
+                    if not key_val:
+                        st.warning("APIキーを入力してください。")
+                    elif not _existing_pin_c and len(pin_val) < 4:
+                        st.warning("管理PINは4桁以上で入力してください。")
+                    else:
                         # localStorage に保存（ブラウザ永続化）
                         st.session_state["_ls_save_claude"] = key_val
                         st.session_state["_ls_anthropic_api_key"] = key_val
+                        # PIN を保存（未設定の場合のみ）
+                        if not _existing_pin_c:
+                            pin_hash = hashlib.sha256(pin_val.encode()).hexdigest()
+                            st.session_state["_ls_save_pin"] = pin_hash
+                            st.session_state["_ls_settings_pin"] = pin_hash
                         st.success("APIキーを保存しました。ブラウザに記憶されます。")
                         try:
                             st.rerun()
                         except AttributeError:
                             st.experimental_rerun()
-                    else:
-                        st.warning("APIキーを入力してください。")
 
         st.divider()
         st.caption("HS / HTS 自動判定ツール v2.0")
