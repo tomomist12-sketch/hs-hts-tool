@@ -17,6 +17,11 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
+try:
+    from streamlit_js_eval import streamlit_js_eval
+    _HAS_JS_EVAL = True
+except ImportError:
+    _HAS_JS_EVAL = False
 import sqlite3
 import csv
 import io
@@ -1057,6 +1062,74 @@ def delete_setting(key: str) -> None:
     conn.close()
 
 
+# ============================================================
+# localStorage ヘルパー（ブラウザ永続保存）
+# ============================================================
+
+def _load_local_storage_keys() -> None:
+    """ブラウザの localStorage からAPIキーを読み込み、session_state に格納する。"""
+    if not _HAS_JS_EVAL:
+        return
+    if "_ls_keys_loaded" in st.session_state:
+        return
+    ls_data = streamlit_js_eval(
+        js_expressions="""(function(){
+            try {
+                return JSON.stringify({
+                    ak: localStorage.getItem('hts_anthropic_api_key') || '',
+                    eci: localStorage.getItem('hts_ebay_client_id') || '',
+                    ecs: localStorage.getItem('hts_ebay_client_secret') || ''
+                });
+            } catch(e) { return '{}'; }
+        })()""",
+        key="ls_loader",
+    )
+    if isinstance(ls_data, str):
+        try:
+            data = json.loads(ls_data)
+            if data.get("ak"):
+                st.session_state["_ls_anthropic_api_key"] = data["ak"]
+            if data.get("eci"):
+                st.session_state["_ls_ebay_client_id"] = data["eci"]
+            if data.get("ecs"):
+                st.session_state["_ls_ebay_client_secret"] = data["ecs"]
+            st.session_state["_ls_keys_loaded"] = True
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+
+def _process_local_storage_ops() -> None:
+    """Pending な localStorage 書き込み/削除を実行する。"""
+    if "_ls_save_claude" in st.session_state:
+        val = st.session_state.pop("_ls_save_claude")
+        components.html(
+            f"<script>try{{localStorage.setItem('hts_anthropic_api_key',{json.dumps(val)})}}catch(e){{}}</script>",
+            height=0,
+        )
+    if "_ls_save_ebay" in st.session_state:
+        pair = st.session_state.pop("_ls_save_ebay")
+        components.html(
+            "<script>try{"
+            f"localStorage.setItem('hts_ebay_client_id',{json.dumps(pair[0])});"
+            f"localStorage.setItem('hts_ebay_client_secret',{json.dumps(pair[1])})"
+            "}catch(e){}</script>",
+            height=0,
+        )
+    if st.session_state.pop("_ls_remove_claude", False):
+        components.html(
+            "<script>try{localStorage.removeItem('hts_anthropic_api_key')}catch(e){}</script>",
+            height=0,
+        )
+    if st.session_state.pop("_ls_remove_ebay", False):
+        components.html(
+            "<script>try{"
+            "localStorage.removeItem('hts_ebay_client_id');"
+            "localStorage.removeItem('hts_ebay_client_secret')"
+            "}catch(e){}</script>",
+            height=0,
+        )
+
+
 def save_result(result: dict) -> int:
     """判定結果を履歴に保存し、挿入された行の id を返す。"""
     conn = get_db_connection()
@@ -1226,7 +1299,8 @@ def _get_ebay_client_credentials() -> Tuple[str, str]:
     eBay Client ID / Client Secret を取得する（優先順位）:
     1. Streamlit Secrets
     2. 環境変数
-    3. SQLite に保存済み（サイドバーから設定）
+    3. ブラウザ localStorage
+    4. SQLite に保存済み（レガシー互換）
     """
     client_id = ""
     client_secret = ""
@@ -1246,7 +1320,13 @@ def _get_ebay_client_credentials() -> Tuple[str, str]:
     if client_id and client_secret:
         return client_id, client_secret
 
-    # DB 保存済み
+    # localStorage（ブラウザ永続保存）
+    ls_cid = st.session_state.get("_ls_ebay_client_id", "")
+    ls_csec = st.session_state.get("_ls_ebay_client_secret", "")
+    if ls_cid and ls_csec:
+        return ls_cid, ls_csec
+
+    # DB 保存済み（レガシー互換）
     try:
         client_id = get_setting("ebay_client_id") or ""
         client_secret = get_setting("ebay_client_secret") or ""
@@ -1318,7 +1398,8 @@ def _get_anthropic_api_key() -> Optional[str]:
     Anthropic API キーを取得する（優先順位）:
     1. Streamlit Secrets (ANTHROPIC_API_KEY)
     2. 環境変数 ANTHROPIC_API_KEY
-    3. SQLite に保存済み（サイドバーから設定）
+    3. ブラウザ localStorage
+    4. SQLite に保存済み（レガシー互換）
     """
     # 方法1: Streamlit Secrets
     try:
@@ -1333,7 +1414,12 @@ def _get_anthropic_api_key() -> Optional[str]:
     if token:
         return token
 
-    # 方法3: DB 保存済み
+    # 方法3: localStorage（ブラウザ永続保存）
+    ls_key = st.session_state.get("_ls_anthropic_api_key", "")
+    if ls_key:
+        return ls_key
+
+    # 方法4: DB 保存済み（レガシー互換）
     try:
         saved = get_setting("anthropic_api_key")
         if saved:
@@ -3365,6 +3451,10 @@ def main() -> None:
     if "claude_api_calls" not in st.session_state:
         st.session_state.claude_api_calls = 0
 
+    # ── localStorage からAPIキーを復元 ──
+    _load_local_storage_keys()
+    _process_local_storage_ops()
+
     # ── サイドバー: 管理者モード ──
     with st.sidebar:
         st.header("⚙️ 設定")
@@ -3400,6 +3490,12 @@ def main() -> None:
                 masked_cid = ebay_cid[:8] + "..." if len(ebay_cid) > 8 else "****"
                 st.success(f"接続済み（{masked_cid}）")
                 if st.button("接続解除", key="btn_ebay_disconnect"):
+                    # localStorage から削除
+                    st.session_state["_ls_remove_ebay"] = True
+                    st.session_state.pop("_ls_ebay_client_id", None)
+                    st.session_state.pop("_ls_ebay_client_secret", None)
+                    st.session_state.pop("_ls_keys_loaded", None)
+                    # DB からも削除（レガシー互換）
                     delete_setting("ebay_client_id")
                     delete_setting("ebay_client_secret")
                     # キャッシュもクリア
@@ -3441,9 +3537,11 @@ def main() -> None:
                         # 接続テスト
                         test_token = _fetch_ebay_app_token(cid_val, csec_val)
                         if test_token:
-                            save_setting("ebay_client_id", cid_val)
-                            save_setting("ebay_client_secret", csec_val)
-                            st.success("接続成功。設定を保存しました。")
+                            # localStorage に保存（ブラウザ永続化）
+                            st.session_state["_ls_save_ebay"] = (cid_val, csec_val)
+                            st.session_state["_ls_ebay_client_id"] = cid_val
+                            st.session_state["_ls_ebay_client_secret"] = csec_val
+                            st.success("接続成功。ブラウザに保存しました。")
                             try:
                                 st.rerun()
                             except AttributeError:
@@ -3464,6 +3562,11 @@ def main() -> None:
                 masked_ck = claude_key[:8] + "..." if len(claude_key) > 8 else "****"
                 st.success(f"接続済み（{masked_ck}）")
                 if st.button("接続解除", key="btn_claude_disconnect"):
+                    # localStorage から削除
+                    st.session_state["_ls_remove_claude"] = True
+                    st.session_state.pop("_ls_anthropic_api_key", None)
+                    st.session_state.pop("_ls_keys_loaded", None)
+                    # DB からも削除（レガシー互換）
                     delete_setting("anthropic_api_key")
                     st.info("Claude API キーを削除しました。")
                     try:
@@ -3491,8 +3594,10 @@ def main() -> None:
                 if st.button("保存して接続", key="btn_claude_save"):
                     key_val = claude_key_input.strip()
                     if key_val:
-                        save_setting("anthropic_api_key", key_val)
-                        st.success("APIキーを保存しました。")
+                        # localStorage に保存（ブラウザ永続化）
+                        st.session_state["_ls_save_claude"] = key_val
+                        st.session_state["_ls_anthropic_api_key"] = key_val
+                        st.success("APIキーを保存しました。ブラウザに記憶されます。")
                         try:
                             st.rerun()
                         except AttributeError:
