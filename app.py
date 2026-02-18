@@ -1144,6 +1144,36 @@ def _process_local_storage_ops() -> None:
         )
 
 
+def _generate_share_code() -> str:
+    """現在のAPI設定から共有コードを生成する。"""
+    payload: dict = {}
+    claude_key = _get_anthropic_api_key()
+    if claude_key:
+        payload["ak"] = claude_key
+    ebay_cid, ebay_csec = _get_ebay_client_credentials()
+    if ebay_cid and ebay_csec:
+        payload["eci"] = ebay_cid
+        payload["ecs"] = ebay_csec
+    pin = st.session_state.get("_ls_settings_pin", "")
+    if pin:
+        payload["pin"] = pin
+    return "HTS-" + base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+def _decode_share_code(code: str) -> Optional[dict]:
+    """共有コードをデコードする。無効なら None を返す。"""
+    try:
+        raw = code.strip()
+        if raw.startswith("HTS-"):
+            raw = raw[4:]
+        payload = json.loads(base64.b64decode(raw.encode()).decode())
+        if isinstance(payload, dict) and (payload.get("ak") or payload.get("eci")):
+            return payload
+        return None
+    except Exception:
+        return None
+
+
 def save_result(result: dict) -> int:
     """判定結果を履歴に保存し、挿入された行の id を返す。"""
     conn = get_db_connection()
@@ -3678,6 +3708,74 @@ def main() -> None:
                             st.rerun()
                         except AttributeError:
                             st.experimental_rerun()
+
+        st.divider()
+        # ── 共有コード ──
+        _any_user_key = bool(
+            st.session_state.get("_ls_anthropic_api_key")
+            or st.session_state.get("_ls_ebay_client_id")
+        )
+        _has_pin = bool(st.session_state.get("_ls_settings_pin"))
+        _any_key_at_all = _get_anthropic_api_key() is not None or bool(
+            _get_ebay_client_credentials()[0]
+        )
+
+        if _any_key_at_all and _has_pin:
+            # ── 管理者用: 共有コード生成 ──
+            with st.expander("外注さんに共有"):
+                st.caption(
+                    "共有コードを外注さんに渡すと、"
+                    "同じAPI設定がそのブラウザに設定されます"
+                )
+                share_pin = st.text_input(
+                    "管理PIN", type="password", key="share_pin_input",
+                    placeholder="PINを入力して共有コードを表示",
+                )
+                if st.button("共有コードを表示", key="btn_show_share"):
+                    stored = st.session_state.get("_ls_settings_pin", "")
+                    if (
+                        stored
+                        and hashlib.sha256(share_pin.encode()).hexdigest()
+                        == stored
+                    ):
+                        code = _generate_share_code()
+                        st.code(code, language=None)
+                        st.caption(
+                            "このコードをコピーして外注さんに送ってください"
+                        )
+                    else:
+                        st.error("管理PINが正しくありません。")
+
+        if not _any_key_at_all:
+            # ── 外注さん用: 共有コード入力 ──
+            st.subheader("共有コードで設定")
+            st.caption("管理者から受け取ったコードを貼り付けてください")
+            share_code_input = st.text_input(
+                "共有コード", key="share_code_input",
+                placeholder="HTS-...",
+            )
+            if st.button("設定する", key="btn_apply_share"):
+                data = _decode_share_code(share_code_input)
+                if data is None:
+                    st.error("共有コードが正しくありません。")
+                else:
+                    if data.get("ak"):
+                        st.session_state["_ls_save_claude"] = data["ak"]
+                        st.session_state["_ls_anthropic_api_key"] = data["ak"]
+                    if data.get("eci") and data.get("ecs"):
+                        st.session_state["_ls_save_ebay"] = (
+                            data["eci"], data["ecs"],
+                        )
+                        st.session_state["_ls_ebay_client_id"] = data["eci"]
+                        st.session_state["_ls_ebay_client_secret"] = data["ecs"]
+                    if data.get("pin"):
+                        st.session_state["_ls_save_pin"] = data["pin"]
+                        st.session_state["_ls_settings_pin"] = data["pin"]
+                    st.success("API設定を復元しました。")
+                    try:
+                        st.rerun()
+                    except AttributeError:
+                        st.experimental_rerun()
 
         st.divider()
         st.caption("HS / HTS 自動判定ツール v2.0")
