@@ -1550,6 +1550,18 @@ def fetch_ebay_item(url: str) -> dict:
         }
         resp = requests.get(api_url, headers=headers, timeout=15)
 
+        # 429 レート制限: Retry-After を待ってリトライ（1回だけ）
+        if resp.status_code == 429:
+            import time
+            retry_after = int(resp.headers.get("Retry-After", "2"))
+            retry_after = min(retry_after, 5)  # 最大5秒
+            time.sleep(retry_after)
+            # トークン再取得してリトライ
+            token2 = _get_ebay_oauth_token()
+            if token2:
+                headers["Authorization"] = f"Bearer {token2}"
+            resp = requests.get(api_url, headers=headers, timeout=15)
+
         if resp.status_code == 401:
             result["error"] = "eBay API認証エラー: トークンが無効または期限切れです。"
             return result
@@ -1654,8 +1666,12 @@ def scrape_product_info(url: str) -> dict:
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
         }
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
@@ -3864,16 +3880,16 @@ def main() -> None:
 
                     if info.get("error"):
                         fetch_failed = True
-                        err_detail = info.get("error", "")
                         st.info(
                             "URL からの情報取得ができませんでした。"
                             "商品名と説明文をもとに判定します。"
                         )
-                        if err_detail:
-                            st.caption(f"詳細: {err_detail}")
-                    if info.get("_api_error"):
-                        st.caption(f"eBay API: {info['_api_error']}（スクレイピングで取得）")
+                        st.caption(f"詳細: {info['error']}")
                     else:
+                        # 成功（API直接 or スクレイピングフォールバック）
+                        if info.get("_api_error"):
+                            st.info("eBay API エラーのためスクレイピングで取得しました")
+
                         # タイトル取得
                         if not product_name and info.get("title"):
                             product_name = info["title"]
