@@ -1547,7 +1547,6 @@ def fetch_ebay_item(url: str) -> dict:
         headers = {
             "Authorization": f"Bearer {token}",
             "X-EBAY-C-MARKETPLACE-ID": marketplace_id,
-            "X-EBAY-C-ENDUSERCTX": "affiliateCampaignId=<ePNCampaignId>,affiliateReferenceId=<referenceId>",
         }
         resp = requests.get(api_url, headers=headers, timeout=15)
 
@@ -1700,15 +1699,30 @@ def scrape_product_info(url: str) -> dict:
 def fetch_product_info(url: str) -> dict:
     """
     URL から商品情報を取得する統合関数。
-    - eBay URL + APIキー設定済み → eBay Browse API を使用
-    - eBay URL + APIキー未設定 → info メッセージ付きで空結果
+    - eBay URL + APIキー設定済み → eBay Browse API を使用（失敗時はスクレイピングにフォールバック）
+    - eBay URL + APIキー未設定 → スクレイピングにフォールバック
     - 非eBay URL → 従来のスクレイピング
     """
     if _is_ebay_url(url):
         token = _get_ebay_oauth_token()
         if token:
-            return fetch_ebay_item(url)
+            result = fetch_ebay_item(url)
+            if not result.get("error"):
+                return result
+            # eBay API 失敗時はスクレイピングにフォールバック
+            api_error = result.get("error", "")
+            fallback = scrape_product_info(url)
+            if not fallback.get("error") and fallback.get("title"):
+                fallback["_api_error"] = api_error
+                return fallback
+            # スクレイピングも失敗した場合は API のエラーを返す
+            result["_api_error"] = api_error
+            return result
         else:
+            # APIキー未設定 → スクレイピングで試みる
+            fallback = scrape_product_info(url)
+            if not fallback.get("error") and fallback.get("title"):
+                return fallback
             return {
                 "title": "",
                 "description": "",
@@ -3850,10 +3864,15 @@ def main() -> None:
 
                     if info.get("error"):
                         fetch_failed = True
+                        err_detail = info.get("error", "")
                         st.info(
                             "URL からの情報取得ができませんでした。"
                             "商品名と説明文をもとに判定します。"
                         )
+                        if err_detail:
+                            st.caption(f"詳細: {err_detail}")
+                    if info.get("_api_error"):
+                        st.caption(f"eBay API: {info['_api_error']}（スクレイピングで取得）")
                     else:
                         # タイトル取得
                         if not product_name and info.get("title"):
