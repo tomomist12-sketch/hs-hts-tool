@@ -1562,6 +1562,22 @@ def fetch_ebay_item(url: str) -> dict:
                 headers["Authorization"] = f"Bearer {token2}"
             resp = requests.get(api_url, headers=headers, timeout=15)
 
+        if resp.status_code == 429:
+            # レート制限の詳細を取得
+            try:
+                body = resp.json()
+                errors = body.get("errors", [])
+                if errors:
+                    err = errors[0]
+                    msg = err.get("message", "")
+                    error_id = err.get("errorId", "")
+                    result["error"] = f"eBay API レート制限 (errorId: {error_id}): {msg}"
+                else:
+                    result["error"] = f"eBay API レート制限 (429): {resp.text[:200]}"
+            except Exception:
+                result["error"] = f"eBay API レート制限 (429): {resp.text[:200]}"
+            return result
+
         if resp.status_code == 401:
             result["error"] = "eBay API認証エラー: トークンが無効または期限切れです。"
             return result
@@ -1735,9 +1751,10 @@ def fetch_product_info(url: str) -> dict:
             result["_api_error"] = api_error
             return result
         else:
-            # APIキー未設定 → スクレイピングで試みる
+            # APIキー未設定またはトークン取得失敗 → スクレイピングで試みる
             fallback = scrape_product_info(url)
             if not fallback.get("error") and fallback.get("title"):
+                fallback["_api_error"] = "トークン取得失敗（APIキー未設定またはレート制限）"
                 return fallback
             return {
                 "title": "",
@@ -3888,7 +3905,7 @@ def main() -> None:
                     else:
                         # 成功（API直接 or スクレイピングフォールバック）
                         if info.get("_api_error"):
-                            st.info("eBay API エラーのためスクレイピングで取得しました")
+                            st.warning(f"eBay API エラーのためスクレイピングで取得しました\n\n原因: {info['_api_error']}")
 
                         # タイトル取得
                         if not product_name and info.get("title"):
