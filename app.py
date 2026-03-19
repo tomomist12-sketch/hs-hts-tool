@@ -67,6 +67,48 @@ def _load_json(filename: str) -> dict:
 HTS_CODES = _load_json("hts_codes.json")    # {"Chapter XX": [{"code":..,"description":..}, ...]}
 JP_HS_CODES = _load_json("jp_hs_codes.json")  # {"Chapter XX": [{"code":..,"hs6":..,"category":..,"description":..}, ...]}
 
+# 有効な HTS コードのフラットセット（バリデーション用）
+_VALID_HTS_CODES: Set[str] = set()
+for _ch_entries in HTS_CODES.values():
+    for _entry in _ch_entries:
+        _VALID_HTS_CODES.add(_entry["code"])
+
+
+def _validate_hts_code(code: str) -> Optional[str]:
+    """
+    HTS コードが hts_codes.json に存在するか検証する。
+    存在すればそのコードを返す。存在しなければ同じ HS6 プレフィックス内で
+    最も近いコードを探して返す。見つからなければ None。
+    """
+    if not code or code == "----------":
+        return None
+
+    # 正規化: ドットを除去して数字のみにし、比較しやすくする
+    clean = code.replace(".", "").replace(" ", "")
+
+    # そのまま存在するか
+    if code in _VALID_HTS_CODES:
+        return code
+
+    # 8桁形式に正規化してチェック (例: 6116.10.0008 → 6116.10.00 を試す)
+    digits_only = re.sub(r"[^0-9]", "", code)
+    if len(digits_only) >= 8:
+        d8 = digits_only[:8]
+        normalized = f"{d8[:4]}.{d8[4:6]}.{d8[6:8]}"
+        if normalized in _VALID_HTS_CODES:
+            return normalized
+
+    # HS6 プレフィックス (最初の6桁 = XXXX.XX) で一致するコードを探す
+    if len(digits_only) >= 6:
+        hs6_prefix = f"{digits_only[:4]}.{digits_only[4:6]}"
+        matching = [c for c in _VALID_HTS_CODES if c.startswith(hs6_prefix)]
+        if matching:
+            # 最初にマッチするものを返す（ソートして安定させる）
+            return sorted(matching)[0]
+
+    return None
+
+
 # ============================================================
 # HS コード分類ルールデータベース
 # ============================================================
@@ -1514,6 +1556,14 @@ def fetch_ebay_item(url: str) -> dict:
       - error: エラーメッセージ（成功時は空文字列）
       - source: "ebay_api"
     """
+    # --- セッション内キャッシュ: 同一商品IDなら API 再呼び出しをスキップ ---
+    cache_key = _extract_ebay_item_id(url) or url
+    if "ebay_item_cache" not in st.session_state:
+        st.session_state.ebay_item_cache = {}  # type: Dict[str, dict]
+    cached = st.session_state.ebay_item_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     result = {
         "title": "",
         "description": "",
@@ -1550,20 +1600,23 @@ def fetch_ebay_item(url: str) -> dict:
         }
         resp = requests.get(api_url, headers=headers, timeout=15)
 
-        # 429 レート制限: Retry-After を待ってリトライ（1回だけ）
-        if resp.status_code == 429:
-            import time
-            retry_after = int(resp.headers.get("Retry-After", "2"))
-            retry_after = min(retry_after, 5)  # 最大5秒
+        # 429 レート制限: 指数バックオフで最大3回リトライ
+        import time
+        _MAX_RETRIES = 3
+        for _retry_i in range(_MAX_RETRIES):
+            if resp.status_code != 429:
+                break
+            retry_after = int(resp.headers.get("Retry-After", str(2 ** (_retry_i + 1))))
+            retry_after = min(retry_after, 30)
             time.sleep(retry_after)
             # トークン再取得してリトライ
-            token2 = _get_ebay_oauth_token()
-            if token2:
-                headers["Authorization"] = f"Bearer {token2}"
+            refreshed = _get_ebay_oauth_token()
+            if refreshed:
+                headers["Authorization"] = f"Bearer {refreshed}"
             resp = requests.get(api_url, headers=headers, timeout=15)
 
         if resp.status_code == 429:
-            # レート制限の詳細を取得
+            # 全リトライ失敗
             try:
                 body = resp.json()
                 errors = body.get("errors", [])
@@ -1629,6 +1682,10 @@ def fetch_ebay_item(url: str) -> dict:
         result["error"] = f"eBay API エラー: {e}"
     except Exception as e:
         result["error"] = f"eBay API 取得エラー: {e}"
+
+    # 成功時のみキャッシュに保存（エラー結果はキャッシュしない）
+    if not result.get("error"):
+        st.session_state.ebay_item_cache[cache_key] = result
 
     return result
 
@@ -1716,6 +1773,27 @@ def scrape_product_info(url: str) -> dict:
             text = soup.get_text(separator=" ", strip=True)
             result["description"] = text[:500]
 
+        # eBay ページ向け: Item Specifics とカテゴリパスを抽出
+        if _is_ebay_url(url):
+            # Item Specifics (eBay の属性テーブル)
+            specifics = {}  # type: Dict[str, str]
+            for row in soup.select(".ux-layout-section-evo__col"):
+                label_el = row.select_one(".ux-labels-values__labels-content span")
+                value_el = row.select_one(".ux-labels-values__values-content span")
+                if label_el and value_el:
+                    k = label_el.get_text(strip=True)
+                    v = value_el.get_text(strip=True)
+                    if k and v:
+                        specifics[k] = v
+            if specifics:
+                result["item_specifics"] = specifics
+            # カテゴリパス (パンくずリスト)
+            breadcrumbs = soup.select("nav.breadcrumbs a span")
+            if breadcrumbs:
+                result["category_path"] = " > ".join(
+                    b.get_text(strip=True) for b in breadcrumbs if b.get_text(strip=True)
+                )
+
     except requests.exceptions.Timeout:
         result["error"] = "タイムアウト: サイトの応答がありませんでした。"
     except requests.exceptions.HTTPError as e:
@@ -1736,13 +1814,19 @@ def fetch_product_info(url: str) -> dict:
     - 非eBay URL → 従来のスクレイピング
     """
     if _is_ebay_url(url):
-        token = _get_ebay_oauth_token()
+        # 429 クオータ切れを記憶: 同セッション内で再度 API を呼ばない
+        api_blocked = st.session_state.get("ebay_api_rate_limited", False)
+
+        token = _get_ebay_oauth_token() if not api_blocked else None
         if token:
             result = fetch_ebay_item(url)
             if not result.get("error"):
                 return result
-            # eBay API 失敗時はスクレイピングにフォールバック
             api_error = result.get("error", "")
+            # 429 ならセッション内で API をスキップするフラグを立てる
+            if "429" in str(api_error):
+                st.session_state.ebay_api_rate_limited = True
+            # eBay API 失敗時はスクレイピングにフォールバック
             fallback = scrape_product_info(url)
             if not fallback.get("error") and fallback.get("title"):
                 fallback["_api_error"] = api_error
@@ -1751,17 +1835,18 @@ def fetch_product_info(url: str) -> dict:
             result["_api_error"] = api_error
             return result
         else:
-            # APIキー未設定またはトークン取得失敗 → スクレイピングで試みる
+            # APIキー未設定/トークン取得失敗/レート制限 → スクレイピングで試みる
+            reason = "eBay API レート制限のためスクレイピングで取得" if api_blocked else "トークン取得失敗（APIキー未設定またはレート制限）"
             fallback = scrape_product_info(url)
             if not fallback.get("error") and fallback.get("title"):
-                fallback["_api_error"] = "トークン取得失敗（APIキー未設定またはレート制限）"
+                fallback["_api_error"] = reason
                 return fallback
             return {
                 "title": "",
                 "description": "",
                 "item_specifics": {},
                 "category_path": "",
-                "error": "eBay APIキーが未設定のため、商品名を手動入力してください。",
+                "error": "商品情報を取得できませんでした。商品名を手動入力してください。",
                 "source": "none",
             }
     else:
@@ -3157,12 +3242,19 @@ def _call_claude_api(
         if not raw_candidates:
             return None
 
-        # classify_product と同じ形式に正規化
+        # classify_product と同じ形式に正規化 + HTSコード存在チェック
         candidates = []
         for c in raw_candidates[:3]:
+            raw_hts = c.get("hts", "----------")
+            validated_hts = _validate_hts_code(raw_hts)
+            if validated_hts is None:
+                # 有効な HTS コードが見つからない候補はスキップ
+                continue
+            # バリデーション後のコードから hs6 を再導出
+            validated_hs6 = validated_hts[:7] if len(validated_hts) >= 7 else c.get("hs6", "-----.--")
             candidates.append({
-                "hs6": c.get("hs6", "-----.--"),
-                "hts": c.get("hts", "----------"),
+                "hs6": validated_hs6,
+                "hts": validated_hts,
                 "jp_hs": c.get("jp_hs", "---------"),
                 "category": c.get("category", "不明"),
                 "material": c.get("material", "不明"),
@@ -3172,6 +3264,10 @@ def _call_claude_api(
                 "confidence": c.get("confidence", "medium"),
                 "_score": 0,
             })
+
+        if not candidates:
+            # 全候補が無効だった場合は None を返してキーワードエンジンにフォールバック
+            return None
 
         # セッションカウンタをインクリメント
         if "claude_api_calls" in st.session_state:
@@ -3309,10 +3405,17 @@ def classify_product(
         if ebay_result is not None and rule_ch == ebay_result[0]:
             reason = "[{}] | {}".format(ebay_result[2], reason)
 
+        # キーワードルールの HTS コード (10桁) の 8桁プレフィックスをバリデーション
+        rule_hts = rule["hts10"]
+        validated_rule_hts = _validate_hts_code(rule_hts)
+        if validated_rule_hts is None:
+            # 有効な HTS コードが見つからないルールはスキップ
+            continue
+
         candidates.append(
             {
                 "hs6": rule["hs6"],
-                "hts": rule["hts10"],
+                "hts": validated_rule_hts,
                 "jp_hs": rule["jp_hs9"],
                 "category": rule["category"],
                 "material": rule["material"],
