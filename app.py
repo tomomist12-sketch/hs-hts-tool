@@ -67,30 +67,95 @@ def _load_json(filename: str) -> dict:
 HTS_CODES = _load_json("hts_codes.json")    # {"Chapter XX": [{"code":..,"description":..}, ...]}
 JP_HS_CODES = _load_json("jp_hs_codes.json")  # {"Chapter XX": [{"code":..,"hs6":..,"category":..,"description":..}, ...]}
 
-# 有効な HTS コードのフラットセット（バリデーション用）
+# 有効な HTS コードのフラットセット（バリデーション用 — ソース1: PDF抽出データ）
 _VALID_HTS_CODES: Set[str] = set()
 for _ch_entries in HTS_CODES.values():
     for _entry in _ch_entries:
         _VALID_HTS_CODES.add(_entry["code"])
 
+# USITC API 検証結果キャッシュ（セッション中の重複リクエスト回避）
+_USITC_API_CACHE: Dict[str, Optional[str]] = {}
+
+USITC_API_URL = "https://hts.usitc.gov/reststop/search"
+
+
+def _verify_via_usitc_api(code: str) -> Optional[str]:
+    """
+    USITC 公式 API (hts.usitc.gov) でコードの存在を検証する。
+    存在すれば正規化された htsno を返す。存在しなければ None。
+    結果はキャッシュされる。
+    """
+    if code in _USITC_API_CACHE:
+        return _USITC_API_CACHE[code]
+
+    # 検索用にドット区切り8桁形式に正規化
+    digits_only = re.sub(r"[^0-9]", "", code)
+    if len(digits_only) < 6:
+        _USITC_API_CACHE[code] = None
+        return None
+
+    # 8桁で検索
+    if len(digits_only) >= 8:
+        search_key = f"{digits_only[:4]}.{digits_only[4:6]}.{digits_only[6:8]}"
+    else:
+        search_key = f"{digits_only[:4]}.{digits_only[4:6]}"
+
+    try:
+        resp = requests.get(
+            USITC_API_URL,
+            params={"keyword": search_key},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            _USITC_API_CACHE[code] = None
+            return None
+
+        results = resp.json()
+        if not isinstance(results, list) or not results:
+            _USITC_API_CACHE[code] = None
+            return None
+
+        # 完全一致するコードを探す（htsno はXXXX.XX.XX.XX形式）
+        for item in results:
+            htsno = item.get("htsno", "")
+            # USITC の htsno (XXXX.XX.XX.XX) から 8桁部分 (XXXX.XX.XX) を抽出
+            hts8 = ".".join(htsno.split(".")[:3]) if htsno.count(".") >= 2 else htsno
+            if hts8 == search_key:
+                _USITC_API_CACHE[code] = hts8
+                return hts8
+
+        # 完全一致がなければ、返されたコードの中で stat suffix 付きのものを確認
+        for item in results:
+            htsno = item.get("htsno", "")
+            if htsno.startswith(search_key):
+                hts8 = ".".join(htsno.split(".")[:3])
+                _USITC_API_CACHE[code] = hts8
+                return hts8
+
+        _USITC_API_CACHE[code] = None
+        return None
+
+    except Exception:
+        _USITC_API_CACHE[code] = None
+        return None
+
 
 def _validate_hts_code(code: str) -> Optional[str]:
     """
-    HTS コードが hts_codes.json に存在するか検証する。
-    存在すればそのコードを返す。存在しなければ同じ HS6 プレフィックス内で
-    最も近いコードを探して返す。見つからなければ None。
+    HTS コードを2つの正規データソースで検証する:
+      1. ローカル hts_codes.json (PDF抽出データ)
+      2. USITC 公式 API (hts.usitc.gov)
+    どちらにも存在しないコードは None を返す。
+    LLMの知識や推測によるコード補完は行わない。
     """
     if not code or code == "----------":
         return None
 
-    # 正規化: ドットを除去して数字のみにし、比較しやすくする
-    clean = code.replace(".", "").replace(" ", "")
-
-    # そのまま存在するか
+    # ── ソース1: ローカル hts_codes.json で完全一致チェック ──
     if code in _VALID_HTS_CODES:
         return code
 
-    # 8桁形式に正規化してチェック (例: 6116.10.0008 → 6116.10.00 を試す)
+    # 8桁形式に正規化してローカルチェック
     digits_only = re.sub(r"[^0-9]", "", code)
     if len(digits_only) >= 8:
         d8 = digits_only[:8]
@@ -98,14 +163,18 @@ def _validate_hts_code(code: str) -> Optional[str]:
         if normalized in _VALID_HTS_CODES:
             return normalized
 
-    # HS6 プレフィックス (最初の6桁 = XXXX.XX) で一致するコードを探す
-    if len(digits_only) >= 6:
-        hs6_prefix = f"{digits_only[:4]}.{digits_only[4:6]}"
-        matching = [c for c in _VALID_HTS_CODES if c.startswith(hs6_prefix)]
-        if matching:
-            # 最初にマッチするものを返す（ソートして安定させる）
-            return sorted(matching)[0]
+    # ── ソース2: USITC 公式 API でオンライン検証 ──
+    api_result = _verify_via_usitc_api(code)
+    if api_result:
+        return api_result
 
+    # 正規化した8桁でもAPI検証を試みる
+    if len(digits_only) >= 8:
+        api_result = _verify_via_usitc_api(normalized)
+        if api_result:
+            return api_result
+
+    # どちらのソースにも存在しない → None（候補から除外）
     return None
 
 
@@ -3147,19 +3216,21 @@ def _call_claude_api(
 
     system_prompt = (
         "You are an expert in HS/HTS tariff classification.\n\n"
-        "【STRICT RULES】\n"
-        "- You MUST only use HTS codes that exist in the 'US HTS Code List' below.\n"
-        "- Do NOT generate or guess any HTS code not in the list.\n"
-        "- Select the most appropriate HTS code (8-digit XXXX.XX.XX) from the list.\n"
+        "【ABSOLUTE RULES — VIOLATION IS FORBIDDEN】\n"
+        "- You MUST ONLY return HTS codes that appear EXACTLY in the 'US HTS Code List' below.\n"
+        "- NEVER generate, guess, interpolate, or infer any HTS code from your training data.\n"
+        "- NEVER modify, pad, or extend a code from the list (e.g. do NOT add stat suffixes).\n"
+        "- The ONLY valid codes are those explicitly listed below. Copy them character-for-character.\n"
+        "- Use the exact 8-digit format XXXX.XX.XX as shown in the list.\n"
         "- For hs6, use the first 6 digits of the HTS code (XXXX.XX).\n"
         "- For jp_hs, use the 'JP HS Code Reference' if available; otherwise append .000 to hs6.\n"
-        "- If no code in the list matches well, pick the closest one and set confidence to \"low\"\n"
-        "  with an explanation in reason.\n\n"
+        "- If no code in the list is a good match, pick the closest one and set confidence to \"low\"\n"
+        "  with an explanation in reason. Do NOT invent a better-sounding code.\n\n"
         "【LANGUAGE RULES】\n"
         "- category, material, usage, reason: MUST be written in Japanese.\n"
         "- hs6, hts, jp_hs, chapter, confidence: keep alphanumeric / English as-is.\n\n"
         f"【Target Chapters】{', '.join(relevant_chapters)}\n\n"
-        "【US HTS Code List (select from this list)】\n"
+        "【US HTS Code List (select from this list ONLY)】\n"
         f"{hts_ref}\n\n"
         "【JP HS Code Reference】\n"
         f"{jp_hs_ref}\n\n"
@@ -3172,7 +3243,7 @@ def _call_claude_api(
         '"category": "日本語カテゴリ名", "material": "日本語素材名", "usage": "日本語用途", '
         '"chapter": "Chapter XX", "reason": "日本語で判定理由", "confidence": "high/medium/low"}\n'
         "]}\n"
-        "Return up to 3 candidates. Select the best matching codes from the US HTS Code List above."
+        "Return up to 3 candidates. ONLY use codes from the US HTS Code List above."
     )
 
     # ユーザーメッセージ構築
